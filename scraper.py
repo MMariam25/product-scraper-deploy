@@ -1,91 +1,103 @@
+import re
 import requests
+from bs4 import BeautifulSoup
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/120.0.0.0 Safari/537.36"
+    )
+}
+
+PRICE_PATTERN = re.compile(r"[\$€£¥MAD]?\s*\d[\d\s,.']*(?:\.\d{1,2})?")
 
 
-class Scraper:
-    def __init__(self, product, url):
-        while url.endswith('/'):
-            url = url[:-1]
-        self.url = url
-        self.product = product
-        self.results = []
+def _meta(soup, *names):
+    for name in names:
+        tag = soup.find("meta", attrs={"property": name}) or soup.find(
+            "meta", attrs={"name": name}
+        )
+        if tag and tag.get("content", "").strip():
+            return tag["content"].strip()
+    return ""
 
-    def fix_url(self, url):
-        if url.startswith("http:") or url.startswith("https:"):
-            return url
-        while url.startswith('/'):
-            url = url[1:]
-        return self.url + '/' + url
 
-    def unpack(self, url, olddata=None, entry=0):
-        if olddata is None:
-            olddata = {}
+def _find_price(soup):
+    for selector in [
+        "[itemprop='price']",
+        ".price",
+        ".product-price",
+        "#price",
+        "[class*='price']",
+        "[id*='price']",
+    ]:
+        el = soup.select_one(selector)
+        if el:
+            text = el.get_text(" ", strip=True)
+            m = PRICE_PATTERN.search(text)
+            if m:
+                return m.group().strip()
+    return ""
+
+
+def scrape_url(url: str) -> list[dict]:
+    resp = requests.get(url, headers=HEADERS, timeout=15)
+    resp.raise_for_status()
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # --- Try Schema.org Product markup first ---
+    products = []
+    for tag in soup.find_all("script", type="application/ld+json"):
         try:
-            req = requests.get(url, timeout=15)
-            req.encoding = 'utf-8'
-            text = req.text
-            text = text[text.index('<div class="home_ul_img">'):]
-            products = text.split('\n                                        <')
-            products = products[1:]
-            for product in products:
-                if entry == 0:
-                    olddata = {}
-                data = {}
-                if '<div class="' in product and '<a title="' in product:
-                    key = '<a title="'
-                    product = product[product.index(key) + len(key):]
-                    key = '" href="'
-                    keyname = 'title-' + str(entry)
-                    if keyname == 'title-0':
-                        keyname = 'category'
-                    data[keyname] = product.split(key)[0]
-                    product = product[product.index(key) + len(key):]
-                    data['href-' + str(entry)] = self.fix_url(product.split('">')[0])
-                    key = '" data-original="'
-                    product = product[product.index(key) + len(key):]
-                    key = '" class="'
-                    keyname = 'image-' + str(entry)
-                    if keyname == 'image-0':
-                        keyname = 'category-image'
-                    data[keyname] = self.fix_url(product.split(key)[0])
-                    for k, v in data.items():
-                        olddata[k] = v
-                    data = dict(olddata)
-                    if entry < 2:
-                        self.unpack(data['href-' + str(entry)], dict(olddata), entry + 1)
-                    else:
-                        req2 = requests.get(data['href-' + str(entry)], timeout=15)
-                        req2.encoding = 'utf-8'
-                        self.extract(req2.text, dict(data))
+            import json
+            data = json.loads(tag.string or "")
+            items = data if isinstance(data, list) else [data]
+            for item in items:
+                if item.get("@type") in ("Product", "product"):
+                    name = item.get("name", "")
+                    image = item.get("image", "")
+                    if isinstance(image, list):
+                        image = image[0]
+                    offers = item.get("offers", {})
+                    if isinstance(offers, list):
+                        offers = offers[0]
+                    price = str(offers.get("price", "")) + " " + offers.get("priceCurrency", "")
+                    sku = item.get("sku", "")
+                    desc = item.get("description", "")
+                    products.append({
+                        "name": name,
+                        "price": price.strip(),
+                        "image": image,
+                        "sku": sku,
+                        "description": desc,
+                        "url": url,
+                    })
         except Exception:
-            pass
+            continue
 
-    def extract(self, text, data=None):
-        if data is None:
-            data = {}
-        try:
-            comment = text.split('<!--  <ul>')[1].split('</ul>')[0].strip()
-        except Exception:
-            return
-        for line in comment.split('</li>'):
-            line = line.strip()
-            if '<a href="' in line:
-                href = line[line.index('<a href="') + 9:].split('" target="_blank">')[0]
-                data['image'] = self.fix_url(href)
-                continue
-            if not line.startswith('<li>'):
-                continue
-            line = line[4:]
-            key = line
-            for sep in [' ', ':', '：']:
-                key = key.split(sep)[0]
-            value = line[len(key):]
-            for sep in [' ', ':', '：']:
-                if sep in value:
-                    value = value[value.index(sep) + len(sep):]
-            data[key] = value
-        self.results.append(dict(data))
+    if products:
+        return products
 
-    def run(self):
-        self.results = []
-        self.unpack(self.url)
-        return self.results
+    # --- Fallback: Open Graph + page-level extraction ---
+    name = (
+        _meta(soup, "og:title")
+        or (soup.find("h1") and soup.find("h1").get_text(strip=True))
+        or soup.title.string.strip() if soup.title else ""
+    )
+    image = _meta(soup, "og:image")
+    price = _meta(soup, "product:price:amount", "og:price:amount") or _find_price(soup)
+    currency = _meta(soup, "product:price:currency", "og:price:currency")
+    desc = _meta(soup, "og:description", "description")
+
+    if price and currency:
+        price = f"{price} {currency}"
+
+    return [{
+        "name": name,
+        "price": price,
+        "image": image,
+        "sku": "",
+        "description": desc,
+        "url": url,
+    }]
